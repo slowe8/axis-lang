@@ -393,6 +393,15 @@ fn render_ssa_value(value: &SsaValue) -> String {
 		SsaValue::Boolean(value) => value.to_string(),
 		SsaValue::String(value) => format!("\"{}\"", value),
 		SsaValue::Char(value) => format!("'{}'", value),
+		SsaValue::CompareEqInt { lhs, rhs } => {
+			format!("cmp_eq_int({}, {})", render_ssa_value(lhs), rhs)
+		}
+		SsaValue::CompareEqChar { lhs, rhs } => {
+			format!("cmp_eq_char({}, '{}')", render_ssa_value(lhs), rhs)
+		}
+		SsaValue::CompareEqString { lhs, rhs } => {
+			format!("cmp_eq_string({}, \"{}\")", render_ssa_value(lhs), rhs)
+		}
 		SsaValue::Name(name) => render_name(name),
 		SsaValue::OpaqueExpr => "<opaque-expr>".to_string(),
 		SsaValue::UnresolvedPlace(place) => format!("<unresolved:{place:?}>"),

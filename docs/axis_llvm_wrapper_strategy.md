@@ -45,6 +45,11 @@ Current backend shape in code:
 - LLVM is now tracked as a git submodule at `third_party/llvm-project`; bootstrap build script: `scripts/bootstrap_llvm.sh`.
 - Default object-emission tool path is `third_party/llvm-build/bin/clang` (override with `AXIS_LLVM_CLANG`).
 - Added executable emission path (`--emit-exe <path>`) that compiles a small entry shim and links it with Axis object output using vendored clang.
+- Added one-command examples runner at `scripts/run_examples.sh` for build-and-run validation of docs examples.
+- Native renderer now disambiguates multiply-defined SSA names across blocks to prevent duplicate LLVM local definitions in control-flow paths.
+- MIR/SSA pipeline now avoids non-converging type inference updates in match-heavy flows via monotonic merge behavior.
+- Boolean `match` lowering now emits concrete branch conditions for boolean/wildcard arms and supports direct constant-folding for literal discriminants.
+- Integer `match` arm dispatch now uses an explicit MIR/SSA compare value path (`CompareEqInt`) for non-literal discriminants.
 
 This allows introducing a real LLVM adapter behind the same trait.
 
@@ -85,3 +90,8 @@ Phase C:
 2. Add a native adapter module skeleton behind feature-gated compilation.
 3. Expand backend lowering coverage in the adapter boundary (constants, branches, returns, phi handling).
 4. Add backend snapshot tests that remain adapter-agnostic where possible.
+
+## Current Known Limitations
+
+1. `match` lowering remains partial for non-boolean/non-integer patterns.
+2. Executable linking currently uses a temporary C shim (`main` -> `axis_main`).

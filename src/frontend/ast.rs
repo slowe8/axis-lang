@@ -203,6 +203,7 @@ pub enum Pattern {
     Integer(i64),
     Boolean(bool),
     String(String),
+    Char(char),
     Tuple(Vec<Pattern>),
     EnumVariant {
         name: String,

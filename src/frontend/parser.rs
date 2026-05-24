@@ -642,6 +642,10 @@ impl<'source> Parser<'source> {
                 self.advance();
                 Pattern::String(value)
             }
+            Token::CharLiteral(value) => {
+                self.advance();
+                Pattern::Char(value)
+            }
             Token::LParen => {
                 self.advance();
                 let mut patterns = Vec::new();

@@ -9,6 +9,8 @@ pub fn validate_text_backend_subset(
 ) -> Result<(), BackendLoweringError> {
 	let bool_type = types.named("bool");
 	let int_type = types.named("int");
+	let string_type = types.named("string");
+	let char_type = types.named("char");
 
 	for block in &ssa.blocks {
 		for phi in &block.phis {
@@ -18,7 +20,9 @@ pub fn validate_text_backend_subset(
 				}
 
 				if let Some(target_type) = ssa_types.type_of_name(&phi.target) {
-					if let Some(incoming_type) = value_type(incoming.value.clone(), ssa_types, bool_type, int_type) {
+					if let Some(incoming_type) =
+						value_type(incoming.value.clone(), ssa_types, bool_type, int_type, string_type, char_type)
+					{
 						if incoming_type != target_type {
 							return Err(BackendLoweringError::PhiTypeMismatch { block: block.id });
 						}
@@ -37,9 +41,18 @@ pub fn validate_text_backend_subset(
 						});
 					}
 
+					if !compare_lhs_types_are_compatible(value, ssa_types, int_type, char_type, string_type) {
+						return Err(BackendLoweringError::AssignTypeMismatch {
+							block: block.id,
+							statement: statement.id,
+						});
+					}
+
 					if let crate::mir::SsaStatementKind::Assign { target, value } = &statement.kind {
 						if let Some(target_type) = ssa_types.type_of_name(target) {
-							if let Some(value_type) = value_type(value.clone(), ssa_types, bool_type, int_type) {
+							if let Some(value_type) =
+								value_type(value.clone(), ssa_types, bool_type, int_type, string_type, char_type)
+							{
 								if value_type != target_type {
 									return Err(BackendLoweringError::AssignTypeMismatch {
 										block: block.id,
@@ -66,13 +79,17 @@ pub fn validate_text_backend_subset(
 				return Err(BackendLoweringError::UnsupportedVoidReturn { block: block.id });
 			}
 			SsaTerminator::Return(Some(value)) => {
+				if !compare_lhs_types_are_compatible(value, ssa_types, int_type, char_type, string_type) {
+					return Err(BackendLoweringError::ReturnTypeMismatch { block: block.id });
+				}
+
 				if !is_supported_return_value(value) {
 					return Err(BackendLoweringError::UnsupportedReturnValue { block: block.id });
 				}
 
 				if let (Some(int_type), Some(return_type)) = (
 					int_type,
-					value_type(value.clone(), ssa_types, bool_type, int_type),
+					value_type(value.clone(), ssa_types, bool_type, int_type, string_type, char_type),
 				) {
 					if return_type != int_type && bool_type.is_some_and(|bool_type| return_type != bool_type) {
 						return Err(BackendLoweringError::ReturnTypeMismatch { block: block.id });
@@ -80,6 +97,10 @@ pub fn validate_text_backend_subset(
 				}
 			}
 			SsaTerminator::Branch { condition, .. } => {
+				if !compare_lhs_types_are_compatible(condition, ssa_types, int_type, char_type, string_type) {
+					return Err(BackendLoweringError::BranchConditionTypeMismatch { block: block.id });
+				}
+
 				if !is_supported_branch_condition(condition) {
 					return Err(BackendLoweringError::UnsupportedBranchCondition { block: block.id });
 				}
@@ -104,12 +125,59 @@ fn value_type(
 	ssa_types: &SsaTypeMap,
 	bool_type: Option<crate::types::TypeId>,
 	int_type: Option<crate::types::TypeId>,
+	string_type: Option<crate::types::TypeId>,
+	char_type: Option<crate::types::TypeId>,
 ) -> Option<crate::types::TypeId> {
 	match value {
 		SsaValue::Boolean(_) => bool_type,
+		SsaValue::CompareEqInt { .. } => bool_type,
+		SsaValue::CompareEqChar { .. } => bool_type,
+		SsaValue::CompareEqString { .. } => bool_type,
 		SsaValue::Integer(_) => int_type,
+		SsaValue::String(_) => string_type,
+		SsaValue::Char(_) => char_type,
 		SsaValue::Name(name) => ssa_types.type_of_name(&name),
 		_ => None,
+	}
+}
+
+fn compare_lhs_types_are_compatible(
+	value: &SsaValue,
+	ssa_types: &SsaTypeMap,
+	int_type: Option<crate::types::TypeId>,
+	char_type: Option<crate::types::TypeId>,
+	string_type: Option<crate::types::TypeId>,
+) -> bool {
+	match value {
+		SsaValue::CompareEqInt { lhs, .. } => operand_matches_type(lhs, ssa_types, int_type, char_type, string_type, int_type),
+		SsaValue::CompareEqChar { lhs, .. } => {
+			operand_matches_type(lhs, ssa_types, int_type, char_type, string_type, char_type)
+		}
+		SsaValue::CompareEqString { lhs, .. } => {
+			operand_matches_type(lhs, ssa_types, int_type, char_type, string_type, string_type)
+		}
+		_ => true,
+	}
+}
+
+fn operand_matches_type(
+	value: &SsaValue,
+	ssa_types: &SsaTypeMap,
+	int_type: Option<crate::types::TypeId>,
+	char_type: Option<crate::types::TypeId>,
+	string_type: Option<crate::types::TypeId>,
+	expected: Option<crate::types::TypeId>,
+) -> bool {
+	let Some(expected) = expected else {
+		return true;
+	};
+
+	match value {
+		SsaValue::Integer(_) => int_type.is_some_and(|ty| ty == expected),
+		SsaValue::Char(_) => char_type.is_some_and(|ty| ty == expected),
+		SsaValue::String(_) => string_type.is_some_and(|ty| ty == expected),
+		SsaValue::Name(name) => ssa_types.type_of_name(name).is_none_or(|ty| ty == expected),
+		_ => false,
 	}
 }
 
@@ -118,7 +186,17 @@ pub fn is_supported_phi_incoming(value: &SsaValue) -> bool {
 }
 
 pub fn is_supported_assign_value(value: &SsaValue) -> bool {
-	matches!(value, SsaValue::Integer(_) | SsaValue::Boolean(_) | SsaValue::Name(_))
+	matches!(
+		value,
+		SsaValue::Integer(_)
+			| SsaValue::Boolean(_)
+			| SsaValue::String(_)
+			| SsaValue::Char(_)
+			| SsaValue::Name(_)
+			| SsaValue::CompareEqInt { .. }
+			| SsaValue::CompareEqChar { .. }
+			| SsaValue::CompareEqString { .. }
+	)
 }
 
 pub fn is_supported_eval_value(value: &SsaValue) -> bool {
@@ -168,7 +246,10 @@ mod tests {
 	}
 
 	fn expected_assign_support(value: &SsaValue) -> bool {
-		matches!(value, SsaValue::Integer(_) | SsaValue::Boolean(_) | SsaValue::Name(_))
+		matches!(
+			value,
+			SsaValue::Integer(_) | SsaValue::Boolean(_) | SsaValue::String(_) | SsaValue::Char(_) | SsaValue::Name(_)
+		)
 	}
 
 	fn expected_eval_support(value: &SsaValue) -> bool {
@@ -461,5 +542,157 @@ mod tests {
 		let error = validate_text_backend_subset(&ssa, &ssa_types, &types)
 			.expect_err("known non-int/bool return type should fail entry return contract");
 		assert_eq!(error, BackendLoweringError::ReturnTypeMismatch { block: 0 });
+	}
+
+	#[test]
+	fn return_compare_string_lhs_type_mismatch_is_rejected_early() {
+		let types = TypeStore::new();
+		let mut ssa_types = SsaTypeMap::default();
+		let int_type = types.named("int").expect("int type should exist");
+
+		let int_name = SsaName {
+			place: MirPlace::Local(Some(SymbolId(30))),
+			version: 1,
+		};
+		let _ = ssa_types.insert_name_type(&int_name, int_type);
+
+		let ssa = LoweredSsaProgram {
+			blocks: vec![SsaBasicBlock {
+				id: 0,
+				phis: Vec::new(),
+				statements: Vec::new(),
+				terminator: SsaTerminator::Return(Some(SsaValue::CompareEqString {
+					lhs: Box::new(SsaValue::Name(int_name)),
+					rhs: "topic".to_string(),
+				})),
+			}],
+			value_count: 0,
+		};
+
+		let error = validate_text_backend_subset(&ssa, &ssa_types, &types)
+			.expect_err("mismatched compare lhs in return should fail before unsupported return checks");
+		assert_eq!(error, BackendLoweringError::ReturnTypeMismatch { block: 0 });
+	}
+
+	#[test]
+	fn branch_compare_string_lhs_type_mismatch_is_rejected_early() {
+		let types = TypeStore::new();
+		let mut ssa_types = SsaTypeMap::default();
+		let int_type = types.named("int").expect("int type should exist");
+
+		let int_name = SsaName {
+			place: MirPlace::Local(Some(SymbolId(31))),
+			version: 1,
+		};
+		let _ = ssa_types.insert_name_type(&int_name, int_type);
+
+		let ssa = LoweredSsaProgram {
+			blocks: vec![SsaBasicBlock {
+				id: 0,
+				phis: Vec::new(),
+				statements: Vec::new(),
+				terminator: SsaTerminator::Branch {
+					condition: SsaValue::CompareEqString {
+						lhs: Box::new(SsaValue::Name(int_name)),
+						rhs: "topic".to_string(),
+					},
+					then_block: 1,
+					else_block: 2,
+				},
+			}],
+			value_count: 0,
+		};
+
+		let error = validate_text_backend_subset(&ssa, &ssa_types, &types)
+			.expect_err("mismatched compare lhs in branch should fail before unsupported branch checks");
+		assert_eq!(error, BackendLoweringError::BranchConditionTypeMismatch { block: 0 });
+	}
+
+	#[test]
+	fn assign_string_literal_must_match_target_type_when_known() {
+		let types = TypeStore::new();
+		let mut ssa_types = SsaTypeMap::default();
+		let int_type = types.named("int").expect("int type should exist");
+
+		let target = SsaName {
+			place: MirPlace::Local(Some(SymbolId(20))),
+			version: 1,
+		};
+		let _ = ssa_types.insert_name_type(&target, int_type);
+
+		let ssa = LoweredSsaProgram {
+			blocks: vec![SsaBasicBlock {
+				id: 0,
+				phis: Vec::new(),
+				statements: vec![SsaStatement {
+					id: 1,
+					kind: SsaStatementKind::Assign {
+						target,
+						value: SsaValue::String("topic".to_string()),
+					},
+				}],
+				terminator: SsaTerminator::Return(Some(SsaValue::Integer(0))),
+			}],
+			value_count: 0,
+		};
+
+		let error = validate_text_backend_subset(&ssa, &ssa_types, &types)
+			.expect_err("string literal assigned to int target should fail");
+		assert_eq!(
+			error,
+			BackendLoweringError::AssignTypeMismatch {
+				block: 0,
+				statement: 1,
+			}
+		);
+	}
+
+	#[test]
+	fn compare_eq_string_lhs_name_must_be_string_when_known() {
+		let types = TypeStore::new();
+		let mut ssa_types = SsaTypeMap::default();
+		let bool_type = types.named("bool").expect("bool type should exist");
+		let int_type = types.named("int").expect("int type should exist");
+
+		let target = SsaName {
+			place: MirPlace::Local(Some(SymbolId(21))),
+			version: 1,
+		};
+		let source = SsaName {
+			place: MirPlace::Local(Some(SymbolId(22))),
+			version: 1,
+		};
+
+		let _ = ssa_types.insert_name_type(&target, bool_type);
+		let _ = ssa_types.insert_name_type(&source, int_type);
+
+		let ssa = LoweredSsaProgram {
+			blocks: vec![SsaBasicBlock {
+				id: 0,
+				phis: Vec::new(),
+				statements: vec![SsaStatement {
+					id: 2,
+					kind: SsaStatementKind::Assign {
+						target,
+						value: SsaValue::CompareEqString {
+							lhs: Box::new(SsaValue::Name(source)),
+							rhs: "topic".to_string(),
+						},
+					},
+				}],
+				terminator: SsaTerminator::Return(Some(SsaValue::Integer(0))),
+			}],
+			value_count: 0,
+		};
+
+		let error = validate_text_backend_subset(&ssa, &ssa_types, &types)
+			.expect_err("compare-eq-string lhs should require known string lhs type");
+		assert_eq!(
+			error,
+			BackendLoweringError::AssignTypeMismatch {
+				block: 0,
+				statement: 2,
+			}
+		);
 	}
 }

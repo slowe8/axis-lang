@@ -2,10 +2,16 @@
 
 use axis_lang::backend::{
     emit_native_executable_file, emit_native_object_file, lower_ssa_to_llvm_ir_with_preference_and_types,
-    LlvmAdapterPreference, LlvmModuleArtifact,
+    BackendLoweringError, LlvmAdapterPreference, LlvmModuleArtifact,
+};
+use axis_lang::hir::SymbolId;
+use axis_lang::mir::{
+    LoweredSsaProgram, MirPlace, SsaBasicBlock, SsaName, SsaStatement, SsaStatementKind, SsaTerminator, SsaTypeMap,
+    SsaValue,
 };
 use axis_lang::passes::{pass_manager_with_config, PassContext, PassProfile, PipelineConfig, PipelineState};
 use axis_lang::resolution::ModulePath;
+use axis_lang::types::TypeStore;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -130,4 +136,152 @@ fn emits_object_for_match_expression_regression_case() {
     assert!(metadata.len() > 0, "match-expression object file should be non-empty");
 
     let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn emits_executable_for_non_literal_bool_match() {
+    if !llvm_toolchain_available() {
+        eprintln!("skipping: vendored clang is not built at {}", vendored_clang_path().display());
+        return;
+    }
+
+    let source = "fn main() -> int { let mood = false; match mood { true => 3, false => 19, } }";
+    let artifact = compile_native_artifact(source);
+    let output_path = unique_temp_path("emit-match-bool-executable", "bin");
+
+    emit_native_executable_file(&artifact, &output_path)
+        .expect("non-literal bool match executable emission should succeed");
+
+    let exit = run_executable(&output_path);
+    assert_eq!(exit, 19);
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn emits_executable_for_non_literal_int_match() {
+    if !llvm_toolchain_available() {
+        eprintln!("skipping: vendored clang is not built at {}", vendored_clang_path().display());
+        return;
+    }
+
+    let source = "fn main() -> int { let code = 2; match code { 1 => 10, 2 => 22, _ => 0, } }";
+    let artifact = compile_native_artifact(source);
+    let output_path = unique_temp_path("emit-match-int-executable", "bin");
+
+    emit_native_executable_file(&artifact, &output_path)
+        .expect("non-literal int match executable emission should succeed");
+
+    let exit = run_executable(&output_path);
+    assert_eq!(exit, 22);
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn emits_executable_for_non_literal_char_match() {
+    if !llvm_toolchain_available() {
+        eprintln!("skipping: vendored clang is not built at {}", vendored_clang_path().display());
+        return;
+    }
+
+    let source = "fn main() -> int { let grade = 'B'; match grade { 'A' => 100, 'B' => 85, _ => 0, } }";
+    let artifact = compile_native_artifact(source);
+    let output_path = unique_temp_path("emit-match-char-executable", "bin");
+
+    emit_native_executable_file(&artifact, &output_path)
+        .expect("non-literal char match executable emission should succeed");
+
+    let exit = run_executable(&output_path);
+    assert_eq!(exit, 85);
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn emits_executable_for_non_literal_string_match() {
+    if !llvm_toolchain_available() {
+        eprintln!("skipping: vendored clang is not built at {}", vendored_clang_path().display());
+        return;
+    }
+
+    let source = "fn main() -> int { let mood = \"party\"; match mood { \"work\" => 2, \"party\" => 42, _ => 0, } }";
+    let artifact = compile_native_artifact(source);
+    let output_path = unique_temp_path("emit-match-string-executable", "bin");
+
+    emit_native_executable_file(&artifact, &output_path)
+        .expect("non-literal string match executable emission should succeed");
+
+    let exit = run_executable(&output_path);
+    assert_eq!(exit, 42);
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn emits_executable_for_non_literal_string_match_fallback() {
+    if !llvm_toolchain_available() {
+        eprintln!("skipping: vendored clang is not built at {}", vendored_clang_path().display());
+        return;
+    }
+
+    let source = "fn main() -> int { let mood = \"rest\"; match mood { \"work\" => 2, \"party\" => 42, _ => 7, } }";
+    let artifact = compile_native_artifact(source);
+    let output_path = unique_temp_path("emit-match-string-fallback-executable", "bin");
+
+    emit_native_executable_file(&artifact, &output_path)
+        .expect("non-literal string match fallback executable emission should succeed");
+
+    let exit = run_executable(&output_path);
+    assert_eq!(exit, 7);
+
+    let _ = fs::remove_file(&output_path);
+}
+
+#[test]
+fn rejects_mistyped_compare_before_native_llvm_emission() {
+    let types = TypeStore::new();
+    let mut ssa_types = SsaTypeMap::default();
+    let bool_type = types.named("bool").expect("bool type should exist");
+    let int_type = types.named("int").expect("int type should exist");
+
+    let target = SsaName {
+        place: MirPlace::Local(Some(SymbolId(90))),
+        version: 1,
+    };
+    let int_name = SsaName {
+        place: MirPlace::Local(Some(SymbolId(91))),
+        version: 1,
+    };
+    let _ = ssa_types.insert_name_type(&target, bool_type);
+    let _ = ssa_types.insert_name_type(&int_name, int_type);
+
+    let ssa = LoweredSsaProgram {
+        blocks: vec![SsaBasicBlock {
+            id: 0,
+            phis: Vec::new(),
+            statements: vec![SsaStatement {
+                id: 0,
+                kind: SsaStatementKind::Assign {
+                    target,
+                    value: SsaValue::CompareEqString {
+                        lhs: Box::new(SsaValue::Name(int_name)),
+                        rhs: "topic".to_string(),
+                    },
+                },
+            }],
+            terminator: SsaTerminator::Return(Some(SsaValue::Integer(0))),
+        }],
+        value_count: 1,
+    };
+
+    let error = lower_ssa_to_llvm_ir_with_preference_and_types(&ssa, &ssa_types, &types, LlvmAdapterPreference::Native)
+        .expect_err("mistyped compare should fail in backend contract before llvm emission");
+    assert_eq!(
+        error,
+        BackendLoweringError::AssignTypeMismatch {
+            block: 0,
+            statement: 0,
+        }
+    );
 }

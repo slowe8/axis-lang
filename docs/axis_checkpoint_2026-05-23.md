@@ -63,3 +63,44 @@ This checkpoint summarizes progress through the initial pass-managed compiler pi
 1. Add declaration-side symbol IDs to typed lets/params so MIR StoreLocal targets declaration identity directly.
 2. Introduce an explicit MIR block cursor model so nested control-flow lowering does not overwrite active terminators.
 3. Extend MIR coverage from scaffolding to normalized CFG suitable for SSA preparation.
+
+## Findings Log (Updated)
+
+1. Native LLVM integration now validated end-to-end
+- Added object and executable emission through vendored clang (`third_party/llvm-build/bin/clang`).
+- Added executable CLI path (`--emit-exe`) and examples runner script (`scripts/run_examples.sh`).
+
+2. Regression root cause: duplicate SSA names across blocks
+- Symptom: LLVM rejected IR with duplicate local definitions in branch-heavy code.
+- Fix: native renderer now disambiguates multiply-defined names with block-scoped suffixing and consistent use resolution.
+
+3. Regression root cause: SSA type propagation could fail to converge
+- Symptom: certain `match`-heavy flows stalled in SSA pass due to conflicting inferred types repeatedly overwriting each other.
+- Fix: type propagation updates are now monotonic via merge rules (`merge_inferred_name_type`), preventing oscillation.
+
+4. Regression root cause: opaque match branch conditions
+- Symptom: backend rejected match lowering with `UnsupportedBranchCondition` for common boolean match cases.
+- Fix: MIR match lowering now emits concrete branch conditions for boolean/wildcard arms and constant-folds boolean-literal discriminants.
+
+5. Integer match compare path introduced
+- Symptom: non-literal integer `match` arms still relied on opaque dispatch behavior.
+- Fix: MIR now emits explicit integer equality compare values (`CompareEqInt`) for integer arm dispatch; SSA/backend and contract support were extended accordingly.
+- Validation: added integration test for non-literal integer match executable emission.
+
+5. New integration tests added
+- `tests/llvm_native_integration.rs` now includes direct LLVM-native checks for:
+	- object emission
+	- executable emission
+	- `if` regression
+	- `match` regression
+	- non-literal boolean `match` executable emission
+
+## Remaining Known Gaps
+
+1. General match lowering beyond bool/int literals
+- Enum/tuple/string/char pattern dispatch still needs explicit compare/decision lowering.
+- Next step is broadening compare operations in MIR/SSA beyond integer-equality primitives.
+
+2. Entry shim strategy is currently C-based
+- Executable emission currently compiles a temporary C `main` shim calling `axis_main`.
+- Future improvement: native startup shim generation without external C source stage.

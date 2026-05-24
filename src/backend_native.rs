@@ -243,6 +243,9 @@ fn render_assign_line(
 		("i64", SsaValue::Integer(integer)) => {
 			ir_text.push_str(&format!("  {target_name} = add i64 0, {integer}\n"));
 		}
+		("i64", SsaValue::String(text)) => {
+			ir_text.push_str(&format!("  {target_name} = add i64 0, {}\n", stable_string_id(text)));
+		}
 		("i64", SsaValue::Boolean(boolean)) => {
 			ir_text.push_str(&format!(
 				"  {target_name} = zext i1 {} to i64\n",
@@ -258,6 +261,13 @@ fn render_assign_line(
 				ir_text.push_str(&format!("  {target_name} = add i64 0, {source_name}\n"));
 			}
 		}
+		("i8", SsaValue::Char(ch)) => {
+			ir_text.push_str(&format!("  {target_name} = add i8 0, {}\n", *ch as u32));
+		}
+		("i8", SsaValue::Name(name)) => {
+			let source_name = render_use_name(name, block_id, None, block_scoped_names);
+			ir_text.push_str(&format!("  {target_name} = add i8 0, {source_name}\n"));
+		}
 		("i1", SsaValue::Boolean(boolean)) => {
 			ir_text.push_str(&format!("  {target_name} = or i1 0, {}\n", if *boolean { 1 } else { 0 }));
 		}
@@ -268,6 +278,21 @@ fn render_assign_line(
 			ir_text.push_str(&format!(
 				"  {target_name} = or i1 0, {}\n",
 				render_use_name(name, block_id, None, block_scoped_names)
+			));
+		}
+		("i1", SsaValue::CompareEqInt { lhs, rhs }) => {
+			let lhs_operand = render_i64_compare_lhs(lhs, block_id, ssa_types, types, block_scoped_names);
+			ir_text.push_str(&format!("  {target_name} = icmp eq i64 {lhs_operand}, {rhs}\n"));
+		}
+		("i1", SsaValue::CompareEqChar { lhs, rhs }) => {
+			let lhs_operand = render_i8_compare_lhs(lhs, block_id, ssa_types, types, block_scoped_names);
+			ir_text.push_str(&format!("  {target_name} = icmp eq i8 {lhs_operand}, {}\n", *rhs as u32));
+		}
+		("i1", SsaValue::CompareEqString { lhs, rhs }) => {
+			let lhs_operand = render_i64_compare_lhs(lhs, block_id, ssa_types, types, block_scoped_names);
+			ir_text.push_str(&format!(
+				"  {target_name} = icmp eq i64 {lhs_operand}, {}\n",
+				stable_string_id(rhs)
 			));
 		}
 		_ => {
@@ -375,10 +400,11 @@ fn render_operand_for_type(
 			if name_llvm_type(name, ssa_types, types) == "i1" {
 				render_use_name(name, current_block, source_block, block_scoped_names)
 			} else {
-				"1".to_string()
+				"0".to_string()
 			}
 		}
 		(_, SsaValue::Integer(integer)) => integer.to_string(),
+		(_, SsaValue::String(text)) => stable_string_id(text).to_string(),
 		(_, SsaValue::Boolean(boolean)) => {
 			if *boolean {
 				"1".to_string()
@@ -457,8 +483,82 @@ fn render_value_debug(value: &SsaValue) -> String {
 		SsaValue::Boolean(value) => value.to_string(),
 		SsaValue::String(value) => format!("\"{}\"", value),
 		SsaValue::Char(value) => format!("'{}'", value),
+		SsaValue::CompareEqInt { lhs, rhs } => {
+			format!("cmp_eq_int({}, {})", render_value_debug(lhs), rhs)
+		}
+		SsaValue::CompareEqChar { lhs, rhs } => {
+			format!("cmp_eq_char({}, '{}')", render_value_debug(lhs), rhs)
+		}
+		SsaValue::CompareEqString { lhs, rhs } => {
+			format!("cmp_eq_string({}, \"{}\")", render_value_debug(lhs), rhs)
+		}
 		SsaValue::Name(name) => render_name(name),
 		SsaValue::OpaqueExpr => "<opaque-expr>".to_string(),
 		SsaValue::UnresolvedPlace(place) => format!("<unresolved:{place:?}>"),
+	}
+}
+
+fn render_i64_compare_lhs(
+	value: &SsaValue,
+	block_id: usize,
+	ssa_types: &SsaTypeMap,
+	types: &TypeStore,
+	block_scoped_names: &HashSet<String>,
+) -> String {
+	match value {
+		SsaValue::Integer(integer) => integer.to_string(),
+		SsaValue::Boolean(boolean) => {
+			if *boolean {
+				"1".to_string()
+			} else {
+				"0".to_string()
+			}
+		}
+		SsaValue::String(text) => stable_string_id(text).to_string(),
+		SsaValue::Name(name) => {
+			if name_llvm_type(name, ssa_types, types) == "i1" {
+				"0".to_string()
+			} else {
+				render_use_name(name, block_id, None, block_scoped_names)
+			}
+		}
+		_ => "0".to_string(),
+	}
+}
+
+fn stable_string_id(text: &str) -> i64 {
+	let mut hash: u64 = 0xcbf29ce484222325;
+	for byte in text.as_bytes() {
+		hash ^= u64::from(*byte);
+		hash = hash.wrapping_mul(0x100000001b3);
+	}
+	(hash & 0x7fff_ffff_ffff_ffff) as i64
+}
+
+fn render_i8_compare_lhs(
+	value: &SsaValue,
+	block_id: usize,
+	ssa_types: &SsaTypeMap,
+	types: &TypeStore,
+	block_scoped_names: &HashSet<String>,
+) -> String {
+	match value {
+		SsaValue::Char(ch) => (*ch as u32).to_string(),
+		SsaValue::Integer(integer) => integer.to_string(),
+		SsaValue::Boolean(boolean) => {
+			if *boolean {
+				"1".to_string()
+			} else {
+				"0".to_string()
+			}
+		}
+		SsaValue::Name(name) => {
+			if name_llvm_type(name, ssa_types, types) == "i8" {
+				render_use_name(name, block_id, None, block_scoped_names)
+			} else {
+				"0".to_string()
+			}
+		}
+		_ => "0".to_string(),
 	}
 }

@@ -1,0 +1,8 @@
+fn main() -> int {
+  let mood = "party";
+  match mood {
+    "work" => 2,
+    "party" => 42,
+    _ => 0,
+  }
+}

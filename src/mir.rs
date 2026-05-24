@@ -99,6 +99,9 @@ pub enum SsaValue {
     Boolean(bool),
     String(String),
     Char(char),
+    CompareEqInt { lhs: Box<SsaValue>, rhs: i64 },
+    CompareEqChar { lhs: Box<SsaValue>, rhs: char },
+    CompareEqString { lhs: Box<SsaValue>, rhs: String },
     Name(SsaName),
     OpaqueExpr,
     UnresolvedPlace(MirPlace),
@@ -149,6 +152,9 @@ pub enum MirValue {
     Boolean(bool),
     String(String),
     Char(char),
+    CompareEqInt { lhs: Box<MirValue>, rhs: i64 },
+    CompareEqChar { lhs: Box<MirValue>, rhs: char },
+    CompareEqString { lhs: Box<MirValue>, rhs: String },
     SymbolRef(Option<SymbolId>),
     Temp(usize),
     OpaqueExpr,
@@ -525,12 +531,67 @@ impl MirBuilder {
                         self.alloc_block(MirTerminator::Return(None))
                     };
 
+                    let (condition, then_block, else_block) = match &arm.pattern {
+                        crate::frontend::ast::Pattern::Boolean(true) => {
+                            (match_value_for_fold.clone(), arm_block, fallback_block)
+                        }
+                        crate::frontend::ast::Pattern::Boolean(false) => {
+                            (match_value_for_fold.clone(), fallback_block, arm_block)
+                        }
+                        crate::frontend::ast::Pattern::Integer(expected) => {
+                            let condition_temp = self.alloc_temp();
+                            self.push_statement(
+                                dispatch_block,
+                                MirStatementKind::AssignPlace {
+                                    place: MirPlace::Temp(condition_temp),
+                                    value: MirValue::CompareEqInt {
+                                        lhs: Box::new(match_value_for_fold.clone()),
+                                        rhs: *expected,
+                                    },
+                                },
+                            );
+                            (MirValue::Temp(condition_temp), arm_block, fallback_block)
+                        }
+                        crate::frontend::ast::Pattern::Char(expected) => {
+                            let condition_temp = self.alloc_temp();
+                            self.push_statement(
+                                dispatch_block,
+                                MirStatementKind::AssignPlace {
+                                    place: MirPlace::Temp(condition_temp),
+                                    value: MirValue::CompareEqChar {
+                                        lhs: Box::new(match_value_for_fold.clone()),
+                                        rhs: *expected,
+                                    },
+                                },
+                            );
+                            (MirValue::Temp(condition_temp), arm_block, fallback_block)
+                        }
+                        crate::frontend::ast::Pattern::String(expected) => {
+                            let condition_temp = self.alloc_temp();
+                            self.push_statement(
+                                dispatch_block,
+                                MirStatementKind::AssignPlace {
+                                    place: MirPlace::Temp(condition_temp),
+                                    value: MirValue::CompareEqString {
+                                        lhs: Box::new(match_value_for_fold.clone()),
+                                        rhs: expected.clone(),
+                                    },
+                                },
+                            );
+                            (MirValue::Temp(condition_temp), arm_block, fallback_block)
+                        }
+                        crate::frontend::ast::Pattern::Wildcard => {
+                            (MirValue::Boolean(true), arm_block, fallback_block)
+                        }
+                        _ => (MirValue::OpaqueExpr, arm_block, fallback_block),
+                    };
+
                     self.set_terminator(
                         dispatch_block,
                         MirTerminator::Branch {
-                            condition: MirValue::OpaqueExpr,
-                            then_block: arm_block,
-                            else_block: fallback_block,
+                            condition,
+                            then_block,
+                            else_block,
                         },
                     );
 
@@ -963,6 +1024,9 @@ fn infer_ssa_value_type(
 ) -> Option<TypeId> {
     match value {
         SsaValue::Boolean(_) => bool_ty,
+        SsaValue::CompareEqInt { .. } => bool_ty,
+        SsaValue::CompareEqChar { .. } => bool_ty,
+        SsaValue::CompareEqString { .. } => bool_ty,
         SsaValue::Integer(_) => int_ty,
         SsaValue::Float(_) => float_ty,
         SsaValue::String(_) => string_ty,
@@ -1041,6 +1105,18 @@ fn map_mir_value_to_ssa(
         MirValue::Boolean(value) => SsaValue::Boolean(*value),
         MirValue::String(value) => SsaValue::String(value.clone()),
         MirValue::Char(value) => SsaValue::Char(*value),
+        MirValue::CompareEqInt { lhs, rhs } => SsaValue::CompareEqInt {
+            lhs: Box::new(map_mir_value_to_ssa(lhs, versions)),
+            rhs: *rhs,
+        },
+        MirValue::CompareEqChar { lhs, rhs } => SsaValue::CompareEqChar {
+            lhs: Box::new(map_mir_value_to_ssa(lhs, versions)),
+            rhs: *rhs,
+        },
+        MirValue::CompareEqString { lhs, rhs } => SsaValue::CompareEqString {
+            lhs: Box::new(map_mir_value_to_ssa(lhs, versions)),
+            rhs: rhs.clone(),
+        },
         MirValue::OpaqueExpr => SsaValue::OpaqueExpr,
         MirValue::Temp(temp) => ssa_name_or_unresolved(MirPlace::Temp(*temp), versions),
         MirValue::SymbolRef(symbol_id) => ssa_name_or_unresolved(MirPlace::Local(*symbol_id), versions),

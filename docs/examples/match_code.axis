@@ -1,0 +1,8 @@
+fn main() -> int {
+  let code = 2;
+  match code {
+    1 => 10,
+    2 => 22,
+    _ => 0,
+  }
+}
