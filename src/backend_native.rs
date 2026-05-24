@@ -1,5 +1,6 @@
 use crate::mir::{LoweredSsaProgram, MirPlace, SsaName, SsaTerminator, SsaTypeMap, SsaValue};
 use crate::types::{Type, TypeId, TypeStore};
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -7,6 +8,8 @@ use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn render_native_llvm_ir(ssa: &LoweredSsaProgram, ssa_types: &SsaTypeMap, types: &TypeStore) -> String {
+	let block_scoped_names = collect_block_scoped_definition_names(ssa);
+
 	let mut ir_text = String::new();
 	ir_text.push_str("; axis-lang native llvm adapter\n");
 	ir_text.push_str("; feature llvm-native enabled\n");
@@ -31,19 +34,40 @@ pub fn render_native_llvm_ir(ssa: &LoweredSsaProgram, ssa_types: &SsaTypeMap, ty
 				.map(|incoming| {
 					format!(
 						"[ {}, %bb{} ]",
-						render_operand_for_type(&incoming.value, phi_type, ssa_types, types),
+						render_operand_for_type(
+							&incoming.value,
+							phi_type,
+							ssa_types,
+							types,
+							block.id,
+							Some(incoming.block),
+							&block_scoped_names,
+						),
 						incoming.block
 					)
 				})
 				.collect::<Vec<_>>()
 				.join(", ");
-			ir_text.push_str(&format!("  {} = phi {} {}\n", render_name(&phi.target), phi_type, incoming));
+			ir_text.push_str(&format!(
+				"  {} = phi {} {}\n",
+				render_definition_name(&phi.target, block.id, &block_scoped_names),
+				phi_type,
+				incoming
+			));
 		}
 
 		for statement in &block.statements {
 			match &statement.kind {
 				crate::mir::SsaStatementKind::Assign { target, value } => {
-					render_assign_line(&mut ir_text, target, value, ssa_types, types);
+					render_assign_line(
+						&mut ir_text,
+						block.id,
+						target,
+						value,
+						ssa_types,
+						types,
+						&block_scoped_names,
+					);
 				}
 				crate::mir::SsaStatementKind::Eval(value) => {
 					ir_text.push_str(&format!("  ; eval {}\n", render_value_debug(value)));
@@ -51,7 +75,14 @@ pub fn render_native_llvm_ir(ssa: &LoweredSsaProgram, ssa_types: &SsaTypeMap, ty
 			}
 		}
 
-		render_terminator_lines(&mut ir_text, block.id, &block.terminator, ssa_types, types);
+		render_terminator_lines(
+			&mut ir_text,
+			block.id,
+			&block.terminator,
+			ssa_types,
+			types,
+			&block_scoped_names,
+		);
 	}
 	ir_text.push_str("}\n");
 
@@ -198,12 +229,14 @@ fn cleanup_temporary_file(path: &Path) {
 
 fn render_assign_line(
 	ir_text: &mut String,
+	block_id: usize,
 	target: &SsaName,
 	value: &SsaValue,
 	ssa_types: &SsaTypeMap,
 	types: &TypeStore,
+	block_scoped_names: &HashSet<String>,
 ) {
-	let target_name = render_name(target);
+	let target_name = render_definition_name(target, block_id, block_scoped_names);
 	let target_type = name_llvm_type(target, ssa_types, types);
 
 	match (target_type, value) {
@@ -218,10 +251,11 @@ fn render_assign_line(
 		}
 		("i64", SsaValue::Name(name)) => {
 			let source_type = name_llvm_type(name, ssa_types, types);
+			let source_name = render_use_name(name, block_id, None, block_scoped_names);
 			if source_type == "i1" {
-				ir_text.push_str(&format!("  {target_name} = zext i1 {} to i64\n", render_name(name)));
+				ir_text.push_str(&format!("  {target_name} = zext i1 {source_name} to i64\n"));
 			} else {
-				ir_text.push_str(&format!("  {target_name} = add i64 0, {}\n", render_name(name)));
+				ir_text.push_str(&format!("  {target_name} = add i64 0, {source_name}\n"));
 			}
 		}
 		("i1", SsaValue::Boolean(boolean)) => {
@@ -231,13 +265,24 @@ fn render_assign_line(
 			ir_text.push_str(&format!("  {target_name} = or i1 0, {}\n", if *integer == 0 { 0 } else { 1 }));
 		}
 		("i1", SsaValue::Name(name)) => {
-			ir_text.push_str(&format!("  {target_name} = or i1 0, {}\n", render_name(name)));
+			ir_text.push_str(&format!(
+				"  {target_name} = or i1 0, {}\n",
+				render_use_name(name, block_id, None, block_scoped_names)
+			));
 		}
 		_ => {
 			ir_text.push_str(&format!(
 				"  ; {} = {}\n",
 				target_name,
-				render_operand_for_type(value, target_type, ssa_types, types)
+				render_operand_for_type(
+					value,
+					target_type,
+					ssa_types,
+					types,
+					block_id,
+					None,
+					block_scoped_names,
+				)
 			));
 		}
 	}
@@ -249,16 +294,23 @@ fn render_terminator_lines(
 	terminator: &SsaTerminator,
 	ssa_types: &SsaTypeMap,
 	types: &TypeStore,
+	block_scoped_names: &HashSet<String>,
 ) {
 	match terminator {
 		SsaTerminator::Return(Some(value)) => match value {
 			SsaValue::Name(name) if name_llvm_type(name, ssa_types, types) == "i1" => {
 				let cast_name = format!("%ret_cast_bb{block_id}");
-				ir_text.push_str(&format!("  {cast_name} = zext i1 {} to i64\n", render_name(name)));
+				ir_text.push_str(&format!(
+					"  {cast_name} = zext i1 {} to i64\n",
+					render_use_name(name, block_id, None, block_scoped_names)
+				));
 				ir_text.push_str(&format!("  ret i64 {cast_name}\n"));
 			}
 			_ => {
-				ir_text.push_str(&format!("  ret i64 {}\n", render_operand_for_type(value, "i64", ssa_types, types)));
+				ir_text.push_str(&format!(
+					"  ret i64 {}\n",
+					render_operand_for_type(value, "i64", ssa_types, types, block_id, None, block_scoped_names)
+				));
 			}
 		},
 		SsaTerminator::Return(None) => ir_text.push_str("  ret void\n"),
@@ -270,7 +322,7 @@ fn render_terminator_lines(
 		} => {
 			ir_text.push_str(&format!(
 				"  br i1 {}, label %bb{}, label %bb{}\n",
-				render_operand_for_type(condition, "i1", ssa_types, types),
+				render_operand_for_type(condition, "i1", ssa_types, types, block_id, None, block_scoped_names),
 				then_block,
 				else_block
 			));
@@ -300,6 +352,9 @@ fn render_operand_for_type(
 	target_type: &str,
 	ssa_types: &SsaTypeMap,
 	types: &TypeStore,
+	current_block: usize,
+	source_block: Option<usize>,
+	block_scoped_names: &HashSet<String>,
 ) -> String {
 	match (target_type, value) {
 		("i1", SsaValue::Boolean(boolean)) => {
@@ -318,7 +373,7 @@ fn render_operand_for_type(
 		}
 		("i1", SsaValue::Name(name)) => {
 			if name_llvm_type(name, ssa_types, types) == "i1" {
-				render_name(name)
+				render_use_name(name, current_block, source_block, block_scoped_names)
 			} else {
 				"1".to_string()
 			}
@@ -331,7 +386,7 @@ fn render_operand_for_type(
 				"0".to_string()
 			}
 		}
-		(_, SsaValue::Name(name)) => render_name(name),
+		(_, SsaValue::Name(name)) => render_use_name(name, current_block, source_block, block_scoped_names),
 		_ => "0".to_string(),
 	}
 }
@@ -344,6 +399,54 @@ fn render_name(name: &SsaName) -> String {
 		},
 		MirPlace::Temp(temp) => format!("%tmp_{}_v{}", temp, name.version),
 	}
+}
+
+fn collect_block_scoped_definition_names(ssa: &LoweredSsaProgram) -> HashSet<String> {
+	let mut definitions: HashMap<String, HashSet<usize>> = HashMap::new();
+
+	for block in &ssa.blocks {
+		for phi in &block.phis {
+			definitions
+				.entry(render_name(&phi.target))
+				.or_default()
+				.insert(block.id);
+		}
+
+		for statement in &block.statements {
+			if let crate::mir::SsaStatementKind::Assign { target, .. } = &statement.kind {
+				definitions.entry(render_name(target)).or_default().insert(block.id);
+			}
+		}
+	}
+
+	definitions
+		.into_iter()
+		.filter_map(|(name, blocks)| if blocks.len() > 1 { Some(name) } else { None })
+		.collect()
+}
+
+fn render_definition_name(name: &SsaName, block_id: usize, block_scoped_names: &HashSet<String>) -> String {
+	let base = render_name(name);
+	if block_scoped_names.contains(&base) {
+		format!("{base}_bb{block_id}")
+	} else {
+		base
+	}
+}
+
+fn render_use_name(
+	name: &SsaName,
+	current_block: usize,
+	source_block: Option<usize>,
+	block_scoped_names: &HashSet<String>,
+) -> String {
+	let base = render_name(name);
+	if !block_scoped_names.contains(&base) {
+		return base;
+	}
+
+	let block_id = source_block.unwrap_or(current_block);
+	format!("{base}_bb{block_id}")
 }
 
 fn render_value_debug(value: &SsaValue) -> String {

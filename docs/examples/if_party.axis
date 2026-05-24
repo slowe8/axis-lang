@@ -1,4 +1,7 @@
 fn main() -> int {
-  let party_score = 42;
-  party_score
+  if true {
+    42
+  } else {
+    1
+  }
 }

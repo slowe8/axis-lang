@@ -492,30 +492,35 @@ impl MirBuilder {
                 let Some(match_block) = match_block else {
                     return (MirValue::Unit, None);
                 };
+                let match_value_for_fold = match_value.clone();
                 self.push_statement(match_block, MirStatementKind::Eval(match_value));
 
                 if arms.is_empty() {
                     return (MirValue::Unit, Some(match_block));
                 }
 
+                if let MirValue::Boolean(discriminant) = match_value_for_fold {
+                    if let Some(selected_arm) = arms.iter().find(|arm| {
+                        match &arm.pattern {
+                            crate::frontend::ast::Pattern::Boolean(value) => *value == discriminant,
+                            crate::frontend::ast::Pattern::Wildcard => true,
+                            _ => false,
+                        }
+                    }) {
+                        return self.lower_expr(match_block, &selected_arm.value);
+                    }
+                }
+
                 let join_block = self.alloc_block(MirTerminator::Return(Some(MirValue::Unit)));
                 let join_temp = self.alloc_temp();
                 let mut incoming_blocks = Vec::new();
-                self.push_statement(
-                    match_block,
-                    MirStatementKind::AssignPlace {
-                        place: MirPlace::Temp(join_temp),
-                        value: MirValue::Unit,
-                    },
-                );
                 let mut dispatch_block = match_block;
-                let mut default_incoming_block = match_block;
 
                 for (index, arm) in arms.iter().enumerate() {
                     let arm_block = self.alloc_block(MirTerminator::Return(None));
                     let fallback_block = if index == arms.len() - 1 {
-                        default_incoming_block = dispatch_block;
-                        join_block
+                        // Treat the final arm as the default fallback path for now.
+                        arm_block
                     } else {
                         self.alloc_block(MirTerminator::Return(None))
                     };
@@ -545,7 +550,6 @@ impl MirBuilder {
                     dispatch_block = fallback_block;
                 }
 
-                incoming_blocks.push(default_incoming_block);
                 self.push_statement(
                     join_block,
                     MirStatementKind::JoinPlace {
@@ -915,7 +919,7 @@ fn propagate_ssa_name_types(ssa: &LoweredSsaProgram, type_map: &mut SsaTypeMap, 
                     .find_map(|incoming| infer_ssa_value_type(&incoming.value, type_map, bool_ty, int_ty, float_ty, string_ty, char_ty, unit_ty));
 
                 if let Some(ty) = inferred {
-                    changed |= type_map.insert_name_type(&phi.target, ty);
+                    changed |= merge_inferred_name_type(type_map, &phi.target, ty, unit_ty);
                 }
             }
 
@@ -923,11 +927,27 @@ fn propagate_ssa_name_types(ssa: &LoweredSsaProgram, type_map: &mut SsaTypeMap, 
                 if let SsaStatementKind::Assign { target, value } = &statement.kind {
                     if let Some(ty) = infer_ssa_value_type(value, type_map, bool_ty, int_ty, float_ty, string_ty, char_ty, unit_ty)
                     {
-                        changed |= type_map.insert_name_type(target, ty);
+                        changed |= merge_inferred_name_type(type_map, target, ty, unit_ty);
                     }
                 }
             }
         }
+    }
+}
+
+fn merge_inferred_name_type(
+    type_map: &mut SsaTypeMap,
+    name: &SsaName,
+    inferred: TypeId,
+    unit_ty: Option<TypeId>,
+) -> bool {
+    match type_map.type_of_name(name) {
+        None => type_map.insert_name_type(name, inferred),
+        Some(existing) if existing == inferred => false,
+        Some(existing) if unit_ty.is_some_and(|unit| existing == unit && inferred != unit) => {
+            type_map.insert_name_type(name, inferred)
+        }
+        Some(_) => false,
     }
 }
 

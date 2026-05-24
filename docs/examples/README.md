@@ -13,12 +13,5 @@ echo $?
 ## Compile and run all examples
 
 ```bash
-mkdir -p target/examples
-for file in docs/examples/*.axis; do
-  name="$(basename "$file" .axis)"
-  exe="target/examples/$name"
-  AXIS_LLVM_BACKEND=native cargo run --features llvm-native -- --emit-exe "$exe" "$file"
-  "$exe"
-  echo "$name => exit=$?"
-done
+./scripts/run_examples.sh
 ```
