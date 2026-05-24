@@ -1,6 +1,6 @@
 use crate::backend_contract::validate_text_backend_subset;
 #[cfg(feature = "llvm-native")]
-use crate::backend_native::{emit_object_from_ir, render_native_llvm_ir};
+use crate::backend_native::{emit_executable_from_ir, emit_object_from_ir, render_native_llvm_ir};
 use crate::mir::{LoweredSsaProgram, MirPlace, SsaTerminator, SsaTypeMap, SsaValue};
 use crate::types::TypeStore;
 use std::path::Path;
@@ -43,6 +43,7 @@ pub enum BackendLoweringError {
 	ReturnTypeMismatch { block: usize },
 	BranchConditionTypeMismatch { block: usize },
 	ObjectEmissionUnavailable,
+	ExecutableEmissionUnavailable,
 	ToolchainInvocationFailed { tool: String, message: String },
 }
 
@@ -85,6 +86,9 @@ impl fmt::Display for BackendLoweringError {
 			BackendLoweringError::ObjectEmissionUnavailable => {
 				write!(f, "object emission requires llvm-native feature")
 			}
+			BackendLoweringError::ExecutableEmissionUnavailable => {
+				write!(f, "executable emission requires llvm-native feature")
+			}
 			BackendLoweringError::ToolchainInvocationFailed { tool, message } => {
 				write!(f, "{tool} invocation failed: {message}")
 			}
@@ -101,9 +105,23 @@ pub fn emit_native_object_file(artifact: &LlvmModuleArtifact, output_path: &Path
 		})
 }
 
+#[cfg(feature = "llvm-native")]
+pub fn emit_native_executable_file(artifact: &LlvmModuleArtifact, output_path: &Path) -> Result<(), BackendLoweringError> {
+	emit_executable_from_ir(&artifact.ir_text, output_path)
+		.map_err(|message| BackendLoweringError::ToolchainInvocationFailed {
+			tool: "vendored llvm clang".to_string(),
+			message,
+		})
+}
+
 #[cfg(not(feature = "llvm-native"))]
 pub fn emit_native_object_file(_artifact: &LlvmModuleArtifact, _output_path: &Path) -> Result<(), BackendLoweringError> {
 	Err(BackendLoweringError::ObjectEmissionUnavailable)
+}
+
+#[cfg(not(feature = "llvm-native"))]
+pub fn emit_native_executable_file(_artifact: &LlvmModuleArtifact, _output_path: &Path) -> Result<(), BackendLoweringError> {
+	Err(BackendLoweringError::ExecutableEmissionUnavailable)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

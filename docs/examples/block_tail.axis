@@ -1,0 +1,4 @@
+fn main() -> int {
+  let score = 11;
+  score
+}

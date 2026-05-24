@@ -44,6 +44,7 @@ Current backend shape in code:
 - Native wrapper now includes object emission support via `--emit-obj <path>` (feature `llvm-native`), invoking a locally built clang from the vendored LLVM checkout.
 - LLVM is now tracked as a git submodule at `third_party/llvm-project`; bootstrap build script: `scripts/bootstrap_llvm.sh`.
 - Default object-emission tool path is `third_party/llvm-build/bin/clang` (override with `AXIS_LLVM_CLANG`).
+- Added executable emission path (`--emit-exe <path>`) that compiles a small entry shim and links it with Axis object output using vendored clang.
 
 This allows introducing a real LLVM adapter behind the same trait.
 

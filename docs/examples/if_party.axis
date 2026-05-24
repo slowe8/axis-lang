@@ -1,0 +1,4 @@
+fn main() -> int {
+  let party_score = 42;
+  party_score
+}

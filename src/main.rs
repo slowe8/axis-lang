@@ -4,7 +4,8 @@ use std::io::{self, Read};
 use std::path::Path;
 
 use axis_lang::backend::{
-    emit_native_object_file, lower_ssa_to_llvm_ir_with_preference_and_types, LlvmAdapterPreference,
+    emit_native_executable_file, emit_native_object_file, lower_ssa_to_llvm_ir_with_preference_and_types,
+    LlvmAdapterPreference,
 };
 use axis_lang::passes::{pass_manager_for_profile, PassContext, PassProfile, PipelineState};
 use axis_lang::resolution::ModulePath;
@@ -21,6 +22,7 @@ struct Cli {
     dump_llvm: bool,
     dump_passes: bool,
     emit_obj: Option<String>,
+    emit_exe: Option<String>,
 }
 
 impl Default for Cli {
@@ -36,6 +38,7 @@ impl Default for Cli {
             dump_llvm: false,
             dump_passes: false,
             emit_obj: None,
+            emit_exe: None,
         }
     }
 }
@@ -105,7 +108,7 @@ fn run() -> Result<(), String> {
         }
     }
 
-    if let Some(output_path) = cli.emit_obj.as_deref() {
+    let native_artifact = if cli.emit_obj.is_some() || cli.emit_exe.is_some() {
         let ssa = state
             .ssa
             .as_ref()
@@ -127,8 +130,27 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
 
-        emit_native_object_file(&artifact, Path::new(output_path)).map_err(|error| error.to_string())?;
+        Some(artifact)
+    } else {
+        None
+    };
+
+    if let Some(output_path) = cli.emit_obj.as_deref() {
+        let artifact = native_artifact
+            .as_ref()
+            .ok_or_else(|| "object emission requires native artifact".to_string())?;
+
+        emit_native_object_file(artifact, Path::new(output_path)).map_err(|error| error.to_string())?;
         println!("Emitted object file: {output_path}");
+    }
+
+    if let Some(output_path) = cli.emit_exe.as_deref() {
+        let artifact = native_artifact
+            .as_ref()
+            .ok_or_else(|| "executable emission requires native artifact".to_string())?;
+
+        emit_native_executable_file(artifact, Path::new(output_path)).map_err(|error| error.to_string())?;
+        println!("Emitted executable file: {output_path}");
     }
 
     if !cli.dump_ast && !cli.dump_hir && !cli.dump_typed && !cli.dump_mir && !cli.dump_ssa && !cli.dump_llvm {
@@ -195,6 +217,13 @@ fn parse_cli() -> Cli {
                 };
                 cli.emit_obj = Some(value);
             }
+            "--emit-exe" => {
+                let Some(value) = args.next() else {
+                    eprintln!("missing value for --emit-exe (expected: output executable file path)");
+                    std::process::exit(2);
+                };
+                cli.emit_exe = Some(value);
+            }
             "--profile" => {
                 let Some(value) = args.next() else {
                     eprintln!("missing value for --profile (expected: dev|test|release)");
@@ -248,7 +277,7 @@ fn load_source(source_path: Option<&str>) -> Result<String, String> {
 }
 
 fn print_usage() {
-    eprintln!("Usage: axis-lang [--profile dev|test|release] [--passes] [--ast] [--hir] [--typed] [--mir] [--ssa] [--llvm] [--emit-obj <path>] <source-file>|-");
+    eprintln!("Usage: axis-lang [--profile dev|test|release] [--passes] [--ast] [--hir] [--typed] [--mir] [--ssa] [--llvm] [--emit-obj <path>] [--emit-exe <path>] <source-file>|-");
     eprintln!("  --profile            choose a pass profile (dev, test, release)");
     eprintln!("  --passes             print pass execution log");
     eprintln!("  --ast, --dump-ast     print the parsed AST");
@@ -258,5 +287,6 @@ fn print_usage() {
     eprintln!("  --ssa, --dump-ssa     print the SSA scaffolding derived from MIR");
     eprintln!("  --llvm, --dump-llvm   print LLVM backend scaffold output");
 	eprintln!("  --emit-obj <path>     emit an object file (requires --features llvm-native)");
+    eprintln!("  --emit-exe <path>     emit an executable file (requires --features llvm-native)");
     eprintln!("  -                     read source from stdin");
 }

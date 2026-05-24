@@ -1,0 +1,4 @@
+fn main() -> int {
+  let mood_points = 19;
+  mood_points
+}

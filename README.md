@@ -86,6 +86,8 @@ Object emission through the native backend uses a vendored LLVM checkout (git su
     - `./scripts/bootstrap_llvm.sh`
 2. Emit an object file from stdin Axis source:
     - `AXIS_LLVM_BACKEND=native cargo run --features llvm-native -- --emit-obj target/tmp/main.o -`
+3. Emit a native executable directly:
+    - `AXIS_LLVM_BACKEND=native cargo run --features llvm-native -- --emit-exe target/tmp/main -`
 
 By default, object emission expects clang at `third_party/llvm-build/bin/clang`. Override with `AXIS_LLVM_CLANG=/custom/path/to/clang` if needed.
 

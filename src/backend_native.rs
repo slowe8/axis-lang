@@ -81,6 +81,71 @@ pub fn emit_object_from_ir(ir_text: &str, output_path: &Path) -> Result<(), Stri
 	}
 }
 
+pub fn emit_executable_from_ir(ir_text: &str, output_path: &Path) -> Result<(), String> {
+	let clang_path = resolve_clang_path()?;
+	let temp_object = temporary_artifact_path(output_path, "obj");
+	let temp_entry_source = temporary_artifact_path(output_path, "entry.c");
+	let temp_entry_object = temporary_artifact_path(output_path, "entry.o");
+
+	emit_object_from_ir(ir_text, &temp_object)?;
+
+	let entry_source = "extern long axis_main(void);\nint main(void) { return (int)axis_main(); }\n";
+	fs::write(&temp_entry_source, entry_source)
+		.map_err(|error| format!("failed to write temporary entry source: {error}"))?;
+
+	let compile_status = Command::new(&clang_path)
+		.arg("-c")
+		.arg(&temp_entry_source)
+		.arg("-o")
+		.arg(&temp_entry_object)
+		.status();
+
+	match compile_status {
+		Ok(status) if status.success() => {}
+		Ok(status) => {
+			cleanup_temporary_file(&temp_object);
+			cleanup_temporary_file(&temp_entry_source);
+			cleanup_temporary_file(&temp_entry_object);
+			return Err(format!(
+				"{} failed to compile entry shim with status {status}",
+				clang_path.display()
+			));
+		}
+		Err(error) => {
+			cleanup_temporary_file(&temp_object);
+			cleanup_temporary_file(&temp_entry_source);
+			cleanup_temporary_file(&temp_entry_object);
+			return Err(format!(
+				"failed to execute {} while compiling entry shim: {error}",
+				clang_path.display()
+			));
+		}
+	}
+
+	let link_status = Command::new(&clang_path)
+		.arg(&temp_object)
+		.arg(&temp_entry_object)
+		.arg("-o")
+		.arg(output_path)
+		.status();
+
+	cleanup_temporary_file(&temp_object);
+	cleanup_temporary_file(&temp_entry_source);
+	cleanup_temporary_file(&temp_entry_object);
+
+	match link_status {
+		Ok(status) if status.success() => Ok(()),
+		Ok(status) => Err(format!(
+			"{} failed to link executable with status {status}",
+			clang_path.display()
+		)),
+		Err(error) => Err(format!(
+			"failed to execute {} while linking executable: {error}",
+			clang_path.display()
+		)),
+	}
+}
+
 fn resolve_clang_path() -> Result<PathBuf, String> {
 	if let Ok(explicit_path) = env::var("AXIS_LLVM_CLANG") {
 		let path = PathBuf::from(explicit_path);
@@ -114,6 +179,21 @@ fn temporary_ir_path(output_path: &Path) -> std::path::PathBuf {
 	let mut path = output_path.to_path_buf();
 	path.set_extension(format!("axis.tmp.{nanos}.ll"));
 	path
+}
+
+fn temporary_artifact_path(output_path: &Path, suffix: &str) -> std::path::PathBuf {
+	let nanos = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.map(|duration| duration.as_nanos())
+		.unwrap_or(0);
+
+	let mut path = output_path.to_path_buf();
+	path.set_extension(format!("axis.tmp.{nanos}.{suffix}"));
+	path
+}
+
+fn cleanup_temporary_file(path: &Path) {
+	let _ = fs::remove_file(path);
 }
 
 fn render_assign_line(
