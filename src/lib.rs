@@ -1,4 +1,7 @@
 pub mod backend;
+mod backend_contract;
+#[cfg(feature = "llvm-native")]
+mod backend_native;
 pub mod borrow;
 pub mod diagnostics;
 pub mod frontend;

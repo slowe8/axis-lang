@@ -2,7 +2,10 @@ use std::collections::BTreeSet;
 
 use crate::diagnostics::Diagnostic;
 use crate::hir::{ResolvedProgram, SymbolId};
-use crate::type_checker::{CheckedBlock, CheckedExpr, CheckedExprKind, CheckedItem, CheckedProgram, CheckedStmtKind};
+use crate::type_checker::{
+    CheckedBlock, CheckedExpr, CheckedExprKind, CheckedItem, CheckedProgram, CheckedStmt, CheckedStmtKind,
+};
+use crate::types::TypeId;
 
 pub fn initialize() {}
 
@@ -19,6 +22,24 @@ pub struct LoweredProgram {
 pub struct LoweredSsaProgram {
     pub blocks: Vec<SsaBasicBlock>,
     pub value_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SsaTypeMap {
+    pub symbol_types: std::collections::BTreeMap<SymbolId, TypeId>,
+    pub name_types: std::collections::BTreeMap<(MirPlace, usize), TypeId>,
+}
+
+impl SsaTypeMap {
+    pub fn insert_name_type(&mut self, name: &SsaName, ty: TypeId) -> bool {
+        self.name_types
+            .insert((name.place.clone(), name.version), ty)
+            .is_none_or(|previous| previous != ty)
+    }
+
+    pub fn type_of_name(&self, name: &SsaName) -> Option<TypeId> {
+        self.name_types.get(&(name.place.clone(), name.version)).copied()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -659,6 +680,277 @@ pub fn build_ssa_scaffold(mir: &LoweredProgram) -> LoweredSsaProgram {
     blocks.sort_by_key(|block| block.id);
 
     LoweredSsaProgram { blocks, value_count }
+}
+
+pub fn build_ssa_scaffold_with_types(mir: &LoweredProgram, tir: &CheckedProgram) -> (LoweredSsaProgram, SsaTypeMap) {
+    let ssa = build_ssa_scaffold(mir);
+    let mut type_map = SsaTypeMap {
+        symbol_types: collect_symbol_types(tir),
+        name_types: std::collections::BTreeMap::new(),
+    };
+
+    seed_symbol_backed_name_types(&ssa, &mut type_map);
+    propagate_ssa_name_types(&ssa, &mut type_map, tir);
+
+    (ssa, type_map)
+}
+
+fn collect_symbol_types(tir: &CheckedProgram) -> std::collections::BTreeMap<SymbolId, TypeId> {
+    let mut symbol_types = std::collections::BTreeMap::new();
+    for item in &tir.items {
+        collect_symbol_types_from_item(item, &mut symbol_types);
+    }
+    symbol_types
+}
+
+fn collect_symbol_types_from_item(
+    item: &CheckedItem,
+    symbol_types: &mut std::collections::BTreeMap<SymbolId, TypeId>,
+) {
+    match item {
+        CheckedItem::Function(function) => {
+            for (symbol_id, parameter) in function.param_symbol_ids.iter().zip(function.signature.parameters.iter()) {
+                if let Some(symbol_id) = symbol_id {
+                    symbol_types.entry(*symbol_id).or_insert(parameter.ty);
+                }
+            }
+            collect_symbol_types_from_block(&function.body, symbol_types);
+        }
+        CheckedItem::Arena(arena) => collect_symbol_types_from_block(&arena.body, symbol_types),
+        CheckedItem::Stmt(statement) => collect_symbol_types_from_stmt(statement, symbol_types),
+        CheckedItem::Module(module_item) => {
+            for nested in &module_item.items {
+                collect_symbol_types_from_item(nested, symbol_types);
+            }
+        }
+        CheckedItem::Impl(impl_item) => {
+            for nested in &impl_item.items {
+                collect_symbol_types_from_item(nested, symbol_types);
+            }
+        }
+        CheckedItem::Struct(_)
+        | CheckedItem::Enum(_)
+        | CheckedItem::TypeAlias(_)
+        | CheckedItem::Use(_) => {}
+    }
+}
+
+fn collect_symbol_types_from_block(
+    block: &CheckedBlock,
+    symbol_types: &mut std::collections::BTreeMap<SymbolId, TypeId>,
+) {
+    for statement in &block.statements {
+        collect_symbol_types_from_stmt(statement, symbol_types);
+    }
+
+    if let Some(tail) = block.tail.as_ref() {
+        collect_symbol_types_from_expr(tail, symbol_types);
+    }
+}
+
+fn collect_symbol_types_from_stmt(
+    statement: &CheckedStmt,
+    symbol_types: &mut std::collections::BTreeMap<SymbolId, TypeId>,
+) {
+    match &statement.kind {
+        CheckedStmtKind::Let {
+            symbol_id,
+            value,
+            ..
+        } => {
+            if let (Some(symbol_id), Some(value)) = (symbol_id, value) {
+                symbol_types.entry(*symbol_id).or_insert(value.ty);
+                collect_symbol_types_from_expr(value, symbol_types);
+            }
+        }
+        CheckedStmtKind::Return(value) => {
+            if let Some(value) = value {
+                collect_symbol_types_from_expr(value, symbol_types);
+            }
+        }
+        CheckedStmtKind::Expr(expr) => collect_symbol_types_from_expr(expr, symbol_types),
+    }
+}
+
+fn collect_symbol_types_from_expr(
+    expr: &CheckedExpr,
+    symbol_types: &mut std::collections::BTreeMap<SymbolId, TypeId>,
+) {
+    if let Some(symbol_id) = expr.symbol_id {
+        symbol_types.entry(symbol_id).or_insert(expr.ty);
+    }
+
+    match &expr.kind {
+        CheckedExprKind::Block(block) => collect_symbol_types_from_block(block, symbol_types),
+        CheckedExprKind::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_symbol_types_from_expr(condition, symbol_types);
+            collect_symbol_types_from_block(then_branch, symbol_types);
+            if let Some(else_branch) = else_branch {
+                collect_symbol_types_from_block(else_branch, symbol_types);
+            }
+        }
+        CheckedExprKind::While { condition, body } => {
+            collect_symbol_types_from_expr(condition, symbol_types);
+            collect_symbol_types_from_block(body, symbol_types);
+        }
+        CheckedExprKind::For {
+            binding_symbol_id,
+            iterable,
+            body,
+            ..
+        } => {
+            if let Some(symbol_id) = binding_symbol_id {
+                symbol_types.entry(*symbol_id).or_insert(expr.ty);
+            }
+            collect_symbol_types_from_expr(iterable, symbol_types);
+            collect_symbol_types_from_block(body, symbol_types);
+        }
+        CheckedExprKind::Match { value, arms } => {
+            collect_symbol_types_from_expr(value, symbol_types);
+            for arm in arms {
+                collect_symbol_types_from_expr(&arm.value, symbol_types);
+            }
+        }
+        CheckedExprKind::Arena { body, .. } => collect_symbol_types_from_block(body, symbol_types),
+        CheckedExprKind::Call { callee, args } => {
+            collect_symbol_types_from_expr(callee, symbol_types);
+            for arg in args {
+                collect_symbol_types_from_expr(arg, symbol_types);
+            }
+        }
+        CheckedExprKind::Field { target, .. }
+        | CheckedExprKind::Try(target)
+        | CheckedExprKind::Unary { expr: target, .. } => collect_symbol_types_from_expr(target, symbol_types),
+        CheckedExprKind::Index { target, index } => {
+            collect_symbol_types_from_expr(target, symbol_types);
+            collect_symbol_types_from_expr(index, symbol_types);
+        }
+        CheckedExprKind::Binary { left, right, .. }
+        | CheckedExprKind::Range {
+            start: left,
+            end: right,
+        } => {
+            collect_symbol_types_from_expr(left, symbol_types);
+            collect_symbol_types_from_expr(right, symbol_types);
+        }
+        CheckedExprKind::Tuple(values) => {
+            for value in values {
+                collect_symbol_types_from_expr(value, symbol_types);
+            }
+        }
+        CheckedExprKind::Identifier(_)
+        | CheckedExprKind::Integer(_)
+        | CheckedExprKind::Float(_)
+        | CheckedExprKind::Boolean(_)
+        | CheckedExprKind::String(_)
+        | CheckedExprKind::Char(_)
+        | CheckedExprKind::Path(_) => {}
+    }
+}
+
+fn seed_symbol_backed_name_types(ssa: &LoweredSsaProgram, type_map: &mut SsaTypeMap) {
+    for block in &ssa.blocks {
+        for phi in &block.phis {
+            seed_symbol_backed_name(&phi.target, type_map);
+            for incoming in &phi.incoming {
+                if let SsaValue::Name(name) = &incoming.value {
+                    seed_symbol_backed_name(name, type_map);
+                }
+            }
+        }
+
+        for statement in &block.statements {
+            match &statement.kind {
+                SsaStatementKind::Assign { target, value } => {
+                    seed_symbol_backed_name(target, type_map);
+                    if let SsaValue::Name(name) = value {
+                        seed_symbol_backed_name(name, type_map);
+                    }
+                }
+                SsaStatementKind::Eval(value) => {
+                    if let SsaValue::Name(name) = value {
+                        seed_symbol_backed_name(name, type_map);
+                    }
+                }
+            }
+        }
+
+        match &block.terminator {
+            SsaTerminator::Return(Some(SsaValue::Name(name))) => seed_symbol_backed_name(name, type_map),
+            SsaTerminator::Branch { condition: SsaValue::Name(name), .. } => seed_symbol_backed_name(name, type_map),
+            _ => {}
+        }
+    }
+}
+
+fn seed_symbol_backed_name(name: &SsaName, type_map: &mut SsaTypeMap) {
+    if let MirPlace::Local(Some(symbol_id)) = &name.place {
+        if let Some(ty) = type_map.symbol_types.get(symbol_id).copied() {
+            let _ = type_map.insert_name_type(name, ty);
+        }
+    }
+}
+
+fn propagate_ssa_name_types(ssa: &LoweredSsaProgram, type_map: &mut SsaTypeMap, tir: &CheckedProgram) {
+    let bool_ty = tir.types.named("bool");
+    let int_ty = tir.types.named("int");
+    let float_ty = tir.types.named("float");
+    let string_ty = tir.types.named("string");
+    let char_ty = tir.types.named("char");
+    let unit_ty = tir.types.named("unit");
+
+    let mut changed = true;
+    while changed {
+        changed = false;
+
+        for block in &ssa.blocks {
+            for phi in &block.phis {
+                let inferred = phi
+                    .incoming
+                    .iter()
+                    .find_map(|incoming| infer_ssa_value_type(&incoming.value, type_map, bool_ty, int_ty, float_ty, string_ty, char_ty, unit_ty));
+
+                if let Some(ty) = inferred {
+                    changed |= type_map.insert_name_type(&phi.target, ty);
+                }
+            }
+
+            for statement in &block.statements {
+                if let SsaStatementKind::Assign { target, value } = &statement.kind {
+                    if let Some(ty) = infer_ssa_value_type(value, type_map, bool_ty, int_ty, float_ty, string_ty, char_ty, unit_ty)
+                    {
+                        changed |= type_map.insert_name_type(target, ty);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn infer_ssa_value_type(
+    value: &SsaValue,
+    type_map: &SsaTypeMap,
+    bool_ty: Option<TypeId>,
+    int_ty: Option<TypeId>,
+    float_ty: Option<TypeId>,
+    string_ty: Option<TypeId>,
+    char_ty: Option<TypeId>,
+    unit_ty: Option<TypeId>,
+) -> Option<TypeId> {
+    match value {
+        SsaValue::Boolean(_) => bool_ty,
+        SsaValue::Integer(_) => int_ty,
+        SsaValue::Float(_) => float_ty,
+        SsaValue::String(_) => string_ty,
+        SsaValue::Char(_) => char_ty,
+        SsaValue::Unit => unit_ty,
+        SsaValue::Name(name) => type_map.type_of_name(name),
+        SsaValue::OpaqueExpr | SsaValue::UnresolvedPlace(_) => None,
+    }
 }
 
 fn compute_block_out_versions(

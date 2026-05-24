@@ -1,16 +1,18 @@
 use std::time::Instant;
 
-use crate::backend::{lower_ssa_to_llvm_ir, LlvmModuleArtifact};
+use crate::backend::{lower_ssa_to_llvm_ir_with_types, LlvmModuleArtifact};
 use crate::diagnostics::{Diagnostic, Diagnostics};
 use crate::frontend::ast::Program;
 use crate::frontend::parser::Parser;
 use crate::hir::{build_hir, ResolvedProgram};
 use crate::mir::{
-    build_ssa_scaffold, lower_from_tir, verify_lowered_program, verify_ssa_scaffold, LoweredProgram, LoweredSsaProgram,
+    build_ssa_scaffold_with_types, lower_from_tir, verify_lowered_program, verify_ssa_scaffold, LoweredProgram,
+    LoweredSsaProgram, SsaTypeMap,
 };
 use crate::resolution::ModulePath;
 use crate::type_checker::CheckedProgram;
 use crate::type_checker::TypeChecker;
+use crate::types::TypeStore;
 
 pub fn initialize() {}
 
@@ -62,8 +64,10 @@ pub struct PipelineState {
     pub ast: Option<Program>,
     pub hir: Option<ResolvedProgram>,
     pub tir: Option<CheckedProgram>,
+    pub backend_types: Option<TypeStore>,
     pub mir: Option<LoweredProgram>,
     pub ssa: Option<LoweredSsaProgram>,
+    pub ssa_types: Option<SsaTypeMap>,
     pub llvm: Option<LlvmModuleArtifact>,
 }
 
@@ -74,8 +78,10 @@ impl PipelineState {
             ast: None,
             hir: None,
             tir: None,
+            backend_types: None,
             mir: None,
             ssa: None,
+            ssa_types: None,
             llvm: None,
         }
     }
@@ -244,6 +250,7 @@ impl CompilerPass for TypeCheckPass {
         let checker = TypeChecker::new(context.module.clone());
         let checked = checker.check_hir(hir);
         context.diagnostics.extend(checked.diagnostics.entries().iter().cloned());
+        state.backend_types = Some(checked.types.clone());
         state.tir = Some(checked);
         Ok(())
     }
@@ -276,9 +283,11 @@ impl CompilerPass for SsaPass {
 
     fn run(&self, state: &mut PipelineState, context: &mut PassContext) -> Result<(), String> {
         let mir = state.mir.as_ref().ok_or_else(|| "ssa pass requires MIR".to_string())?;
-        let ssa = build_ssa_scaffold(mir);
+        let tir = state.tir.as_ref().ok_or_else(|| "ssa pass requires TIR".to_string())?;
+        let (ssa, ssa_types) = build_ssa_scaffold_with_types(mir, tir);
         let diagnostics = verify_ssa_scaffold(&ssa);
         context.diagnostics.extend(diagnostics);
+        state.ssa_types = Some(ssa_types);
         state.ssa = Some(ssa);
         Ok(())
     }
@@ -291,9 +300,23 @@ impl CompilerPass for BackendLlvmPass {
         "backend-llvm"
     }
 
-    fn run(&self, state: &mut PipelineState, _context: &mut PassContext) -> Result<(), String> {
+    fn run(&self, state: &mut PipelineState, context: &mut PassContext) -> Result<(), String> {
+        if context.diagnostics.has_errors() {
+            return Err("backend-llvm pass aborted due to existing diagnostics".to_string());
+        }
+
         let ssa = state.ssa.as_ref().ok_or_else(|| "backend-llvm pass requires SSA".to_string())?;
-        state.llvm = Some(lower_ssa_to_llvm_ir(ssa));
+        let ssa_types = state
+            .ssa_types
+            .as_ref()
+            .ok_or_else(|| "backend-llvm pass requires SSA type map".to_string())?;
+        let types = state
+            .backend_types
+            .as_ref()
+            .ok_or_else(|| "backend-llvm pass requires backend types".to_string())?;
+        state.llvm = Some(
+            lower_ssa_to_llvm_ir_with_types(ssa, ssa_types, types).map_err(|error| error.to_string())?,
+        );
         Ok(())
     }
 }
@@ -313,8 +336,10 @@ mod tests {
         assert!(state.ast.is_some());
         assert!(state.hir.is_some());
         assert!(state.tir.is_some());
+        assert!(state.backend_types.is_some());
         assert!(state.mir.is_some());
         assert!(state.ssa.is_some());
+        assert!(state.ssa_types.is_some());
         assert!(state.llvm.is_some());
         assert_eq!(context.logs.len(), 6);
     }
@@ -328,6 +353,23 @@ mod tests {
         manager.run(&mut state, &mut context).expect("release pipeline run should succeed");
         assert!(state.mir.is_some());
         assert!(state.ssa.is_some());
+        assert!(state.ssa_types.is_some());
         assert!(state.llvm.is_some());
+    }
+
+    #[test]
+    fn backend_pass_requires_backend_types_artifact() {
+        let mut state = PipelineState::new("".to_string());
+        state.ssa = Some(LoweredSsaProgram {
+            blocks: Vec::new(),
+            value_count: 0,
+        });
+        state.ssa_types = Some(SsaTypeMap::default());
+
+        let mut context = PassContext::default();
+        let pass = BackendLlvmPass;
+
+        let error = pass.run(&mut state, &mut context).expect_err("backend pass should require backend types");
+        assert!(error.contains("backend types"));
     }
 }

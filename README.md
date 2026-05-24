@@ -78,6 +78,17 @@ Axis provides hints for optimization:
 
 Axis is in early development (Draft 0.1). The specification is evolving and many features are planned but not yet implemented.
 
+## Vendored LLVM Build
+
+Object emission through the native backend uses a vendored LLVM checkout (git submodule) and a locally built clang binary.
+
+1. Initialize and build LLVM/clang:
+    - `./scripts/bootstrap_llvm.sh`
+2. Emit an object file from stdin Axis source:
+    - `AXIS_LLVM_BACKEND=native cargo run --features llvm-native -- --emit-obj target/tmp/main.o -`
+
+By default, object emission expects clang at `third_party/llvm-build/bin/clang`. Override with `AXIS_LLVM_CLANG=/custom/path/to/clang` if needed.
+
 See [docs/axis_core_spec.md](docs/axis_core_spec.md) for the full language specification.
 
 ## License
